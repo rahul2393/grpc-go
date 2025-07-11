@@ -32,6 +32,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 	"google.golang.org/grpc/codes"
@@ -736,6 +738,16 @@ func (e NewStreamError) Error() string {
 // NewStream creates a stream and registers it into the transport as "active"
 // streams.  All non-nil errors returned will be *NewStreamError.
 func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientStream, error) {
+	// Add OpenTelemetry trace event for gRPC overhead started (similar to Java implementation)
+	if span := trace.SpanFromContext(ctx); span.IsRecording() {
+		span.AddEvent("gRPC overhead started", trace.WithAttributes(
+			attribute.String("grpc.method", callHdr.Method),
+			attribute.String("grpc.event_type", "grpc_overhead_started"),
+		))
+	}
+	// Fallback to logging if no active span
+	t.logger.Infof("gRPC overhead started: method=%s", callHdr.Method)
+
 	ctx = peer.NewContext(ctx, t.getPeer())
 
 	// ServerName field of the resolver returned address takes precedence over
@@ -1168,6 +1180,7 @@ func (t *http2Client) updateFlowControl(n uint32) {
 
 func (t *http2Client) handleData(f *http2.DataFrame) {
 	size := f.Header().Length
+
 	var sendBDPPing bool
 	if t.bdpEst != nil {
 		sendBDPPing = t.bdpEst.add(size)
@@ -1205,6 +1218,18 @@ func (t *http2Client) handleData(f *http2.DataFrame) {
 	if s == nil {
 		return
 	}
+
+	// Add OpenTelemetry trace event for transport data received (using stream context)
+	if span := trace.SpanFromContext(s.ctx); span.IsRecording() {
+		span.AddEvent("Transport data received", trace.WithAttributes(
+			attribute.Int("grpc.stream_id", int(f.Header().StreamID)),
+			attribute.Int("grpc.data_size_bytes", int(size)),
+			attribute.String("grpc.event_type", "transport_data_received"),
+		))
+	}
+	// Fallback to logging if no active span
+	t.logger.Infof("Transport data received: stream=%d, size=%d bytes", f.Header().StreamID, size)
+
 	if size > 0 {
 		if err := s.fc.onData(size); err != nil {
 			t.closeStream(s, io.EOF, true, http2.ErrCodeFlowControl, status.New(codes.Internal, err.Error()), nil, false)
